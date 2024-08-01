@@ -9,6 +9,8 @@ from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.smith import RunEvalConfig, run_on_dataset
 from langchain import PromptTemplate, LLMChain
 from xgboost import XGBClassifier
+from xgboost import plot_tree
+from xgboost import to_graphviz
 import faiss
 import numpy as np
 import faiss
@@ -17,6 +19,8 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 import joblib
 import faiss.contrib.torch_utils
 import torch
+import matplotlib.pyplot as plt
+import shap
 
 load_dotenv(find_dotenv())
 os.environ["LANGCHAIN_API_KEY"] = str(os.getenv("LANGCHAIN_API_KEY"))
@@ -81,7 +85,24 @@ def rescale_transaction(transaction):
         transaction[col] = categorical_encoders[col].inverse_transform(transaction[col].astype(int))
     return transaction
 
-def get_response_from_query(index, transaction, k=5, llm = "GPT-3.5", temperature=0.2):
+def format_important_features(sorted_features):
+    full_form_features = {
+        'category': 'Category',
+        'amt': 'Amount',
+        'city': 'City',
+        'state': 'State',
+        'lat': 'Latitude',
+        'long': 'Longitude',
+        'city_pop': 'City Population',
+        'age': 'Age',
+    }
+    formatted_features = []
+    for feature in sorted_features:
+        feature_name = full_form_features.get(feature, feature)
+        formatted_features.append(feature_name)
+    return formatted_features
+
+def get_response_from_query(index, transaction, shap_importance_features, k=5, llm = "GPT-3.5", temperature=0.2):
     # loading similar transactions to given transaction
     copy_transaction = transaction.copy()
     dataset = pd.read_csv("assets/data/training_data.csv")
@@ -103,56 +124,25 @@ def get_response_from_query(index, transaction, k=5, llm = "GPT-3.5", temperatur
         chat = ChatOpenAI(model_name="gpt-4", temperature= temperature)
     elif llm == "GPT-4 Turbo":
         chat = ChatOpenAI(model_name="gpt-4-turbo", temperature= temperature)
-
-
-    # Template to use for the system message prompt
-    # prompt_template = """
-    #     You are a helpful assistant that can explain why the following transaction has been flagged
-    #     as fraud by a XGBoost based machine learning model: 
-        
-    #     Amount: {amt}, City: {city}, State: {state}, Latitude: {lat}, Longitude: {long}, City Population: {city_pop}, Age: {age}
-        
-    #     Use information from relevant transactions:
-    #     {similar_transactions}
-
-    #     If you feel like you don't have enough information to answer the question, say "I don't know".
-    #     """
     
     prompt_template = """
         You are a helpful assistant that serves a customer of a large bank. The customer is asking why the following transaction has been flagged
         as fraud by the system: 
         
-        Amount: {amt}, City: {city}, State: {state}, Latitude: {lat}, Longitude: {long}, City Population: {city_pop}, Age: {age}
+        Category: {category}, Amount: {amt}, City: {city}, State: {state}, Latitude: {lat}, Longitude: {long}, City Population: {city_pop}, Age: {age}
         
-        Use information from relevant transactions:
-        {similar_transactions}
+        The bank uses an XGBoost model to detect fraud. Running the prediction through SHAP, the most important features that influenced the model's decision are:
+        {important_features}
 
-        The bank systems use an XGBoost model to predict fraud. Use the relevant transactions and the given transaction to explain why the transaction has been flagged as fraud.
-        Do not reveal the internal system workings or the relevant transactions to the customer.
+        Use this info to explain why the transaction was flagged as fraud while correlating the important features with the transaction details.
         """
     
     prompt = PromptTemplate(
-        input_variables=["category", "amt", "city", "state", "lat", "long", "city_pop", "age", "is_fraud", "similar_transactions"],
+        input_variables=["category", "amt", "city", "state", "lat", "long", "city_pop", "age", "important_features"],
         template=prompt_template
     )
 
     chain = prompt | chat
-
-    # llm_chain = LLMChain(llm=chat, prompt_template=prompt)
-
-    # Re-sclaing our given transaction
-
-    # numeric_columns = ['amt', 'lat', 'long', 'city_pop', 'age', 'is_fraud']
-    # categorical_columns = ['category', 'city', 'state']
-
-    # numeric_scaler = pickle.load(open('/assets/models/scalers/numeric_scaler.pkl', 'rb')) 
-    # categorical_encoders = pickle.load(open('/assets/models/encoders/categorical_encoders.pkl', 'rb'))
-
-    # re_scaled_transaction = transaction.copy()
-
-    # re_scaled_transaction[numeric_columns] = numeric_scaler.inverse_transform(transaction[numeric_columns])
-    # for col in categorical_columns:
-    #     re_scaled_transaction[col] = categorical_encoders[col].inverse_transform(transaction[col].astype(int))
 
     re_scaled_transaction = rescale_transaction(copy_transaction.transpose())
     re_scaled_transaction['is_fraud'] = 1
@@ -166,8 +156,9 @@ def get_response_from_query(index, transaction, k=5, llm = "GPT-3.5", temperatur
     'long': re_scaled_transaction['long'],
     'city_pop': re_scaled_transaction['city_pop'],
     'age': re_scaled_transaction['age'],
-    'is_fraud': re_scaled_transaction['is_fraud'],
-    'similar_transactions': formatted_transactions
+    # 'is_fraud': re_scaled_transaction['is_fraud'],
+    # 'similar_transactions': formatted_transactions
+    'important_features': shap_importance_features
     }
 
     explanation = chain.invoke(new_transaction_data)
@@ -182,11 +173,27 @@ def loadTestingdata():
 
 def predictXGB(data):
     # all_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age']
-    # data = data.T
-    # data.columns = all_columns
-    # st.write(data)
     prediction = model.predict(data)
-    return prediction
+    explainer = shap.Explainer(model)
+    shap_values = explainer(data)
+    return prediction, shap_values
+
+def plot_tree_wrapper(xgb_model, filename, rankdir='UT'):
+    """
+    Plot the tree in high resolution
+    :param xgb_model: xgboost trained model
+    :param filename: the pdf file where this is saved
+    :param rankdir: direction of the tree: default Top-Down (UT), accepts:'LR' for left-to-right tree
+    :return:
+    """
+    gvz = to_graphviz(xgb_model, num_trees = 0, rankdir=rankdir)
+    _, file_extension = os.path.splitext(filename)
+    format = file_extension.strip('.').lower()
+    data = gvz.pipe(format=format)
+    full_filename = filename
+
+    with open(full_filename, 'wb') as f:
+        f.write(data)
 
 if __name__ == "__main__":
     st.set_page_config(
@@ -207,13 +214,20 @@ if __name__ == "__main__":
     data_sample.columns = all_columns
     st.write(f"Transaction {sample} scaled values is:")
     st.write(data_sample)
-    prediction = predictXGB(data_sample)
+    # plot_tree_wrapper(model, 'xgb_tree.pdf', rankdir='UT')
+    # st.pyplot(plt.gcf())
+    prediction, shap_values = predictXGB(data_sample)
+    shap.plots.waterfall(shap_values[0])
+    shap.plots.beeswarm(shap_values)
+    st.pyplot(plt.gcf())
     if prediction[0] == 1:
         st.write("### This transaction is flagged as **FRAUD**")
         st.write("#### Let's try to explain why this transaction is flagged as fraud.")
-        explanation = get_response_from_query(loadVectorStore(), data_sample, 5, llm, temperature)
+        shap_importance = pd.DataFrame(shap_values[0].values, all_columns).abs().sort_values(by=0, ascending=False).T
+        st.write(shap_importance.columns.tolist())
+        explanation = get_response_from_query(loadVectorStore(), data_sample, format_important_features(shap_importance), 5, llm, temperature)
         st.write(explanation.content)
     else:
         st.write("### This transaction is **NOT** flagged as fraud.")
 
-# Fraud transactions: 2479, 2238
+# Fraud transactions: 2479, 2238, 2457
