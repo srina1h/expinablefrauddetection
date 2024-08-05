@@ -33,6 +33,8 @@ client = Client()
 model = XGBClassifier()
 model.load_model("assets/models/xgboost_model.model")
 
+fraud_data = pd.read_csv("assets/data/fraud_data.csv")
+
 def createVectorStore():
     x_train = pd.read_csv("assets/data/x_train.csv")
     y_train = pd.read_csv("assets/data/y_train.csv")
@@ -55,7 +57,7 @@ def createVectorStore():
     faiss.write_index(index, 'assets/data/train_x_y.index')
 
 def loadVectorStore():
-    if os.path.exists("assets/data/train_x_y.idx"):
+    if os.path.exists("assets/data/train_x_y.index"):
         index = faiss.read_index("assets/data/train_x_y.index")
     else:
         createVectorStore()
@@ -69,8 +71,29 @@ def format_transactions(transactions):
         formatted.append(txn_str)
     return "\n".join(formatted)
 
+def format_recent_transactions(transactions):
+    formatted = []
+    full_form_features = {
+        'category': 'Category',
+        'amt': 'Amount',
+        'city': 'City',
+        'state': 'State',
+        'lat': 'Latitude',
+        'long': 'Longitude',
+        'city_pop': 'City Population',
+        'age': 'Age',
+    }
+    for i, txn in enumerate(transactions):
+        txn_str = f"Transaction {i+1}:"
+        for col in txn.keys():
+            feature_name = full_form_features[col]
+            txn_str += f" {feature_name}: {txn[col]},"
+        txn_str += f"\n"
+        formatted.append(txn_str)
+    return formatted
+
 def rescale_transaction(transaction):
-    numeric_columns = ['amt', 'lat', 'long', 'city_pop', 'age']
+    transaction_id = transaction.pop('trans_num')
     categorical_columns = ['category', 'city', 'state']
     all_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age']
 
@@ -81,8 +104,10 @@ def rescale_transaction(transaction):
     transaction.columns = all_columns
     transaction = pd.DataFrame(numeric_scaler.inverse_transform(transaction))
     transaction.columns = all_columns
+    print(transaction)
     for col in categorical_columns:
         transaction[col] = categorical_encoders[col].inverse_transform(transaction[col].astype(int))
+    transaction['trans_num'] = transaction_id
     return transaction
 
 def format_important_features(sorted_features):
@@ -102,19 +127,17 @@ def format_important_features(sorted_features):
         formatted_features.append(feature_name)
     return formatted_features
 
-def get_response_from_query(index, transaction, shap_importance_features, k=5, llm = "GPT-3.5", temperature=0.2):
-    # loading similar transactions to given transaction
-    copy_transaction = transaction.copy()
-    dataset = pd.read_csv("assets/data/training_data.csv")
+def get_recent_transactions_for_user(transaction, top_5_important_features, number_of_transactions=10):
+    full_transaction = fraud_data[(fraud_data['trans_num'] == transaction['trans_num'].values[0])]
+    recent_user_transactions = fraud_data[(fraud_data['cc_num'] == full_transaction['cc_num'].values[0])].tail(number_of_transactions)
+    recent_user_transactions = recent_user_transactions[top_5_important_features]
+    return recent_user_transactions
+
+def get_response_from_query(index, transaction, shap_importance_features, re_scaled_transaction, top_5_important_features, k=5, llm = "GPT-3.5", temperature=0.2):
     transaction['is_fraud'] = 1
 
-    vector = torch.from_numpy(transaction.astype(np.float32).to_numpy()).contiguous()
-
-    _, indices = index.search(vector, k=k)
-    similar_transactions = dataset.iloc[indices[0]].to_dict(orient='records')
-
-    formatted_transactions = format_transactions(similar_transactions)
-
+    user_transactions = get_recent_transactions_for_user(transaction, top_5_important_features, 100)
+    st.write(user_transactions)
     # loading language model
     if llm == "GPT-3.5":
         chat = ChatOpenAI(model_name="gpt-3.5", temperature = temperature)
@@ -134,17 +157,19 @@ def get_response_from_query(index, transaction, shap_importance_features, k=5, l
         The bank uses an XGBoost model to detect fraud. Running the prediction through SHAP, the most important features that influenced the model's decision are:
         {important_features}
 
+        Here are the last 10 transactions for this user:
+        {recent_transactions}
+
         Use this info to explain why the transaction was flagged as fraud while correlating the important features with the transaction details.
         """
     
     prompt = PromptTemplate(
-        input_variables=["category", "amt", "city", "state", "lat", "long", "city_pop", "age", "important_features"],
+        input_variables=["category", "amt", "city", "state", "lat", "long", "city_pop", "age", "important_features", "recent_transactions"],
         template=prompt_template
     )
 
     chain = prompt | chat
 
-    re_scaled_transaction = rescale_transaction(copy_transaction.transpose())
     re_scaled_transaction['is_fraud'] = 1
 
     new_transaction_data = {
@@ -156,18 +181,17 @@ def get_response_from_query(index, transaction, shap_importance_features, k=5, l
     'long': re_scaled_transaction['long'],
     'city_pop': re_scaled_transaction['city_pop'],
     'age': re_scaled_transaction['age'],
-    # 'is_fraud': re_scaled_transaction['is_fraud'],
-    # 'similar_transactions': formatted_transactions
-    'important_features': shap_importance_features
+    'important_features': shap_importance_features,
+    'recent_transactions': format_recent_transactions(user_transactions.to_dict(orient='records'))
     }
 
     explanation = chain.invoke(new_transaction_data)
-    print(explanation)
     return explanation
 
 def loadTestingdata():
-    x_test = pd.read_csv("assets/data/x_test.csv")
-    x_test = x_test.iloc[:, 1:]
+    x_test = pd.read_csv("assets/data/X_test.csv")
+    print(x_test.columns)
+    # x_test = x_test.iloc[:, 1:]
     y_test = pd.read_csv("assets/data/y_test.csv")
     return x_test, y_test
 
@@ -207,25 +231,26 @@ if __name__ == "__main__":
     llm = st.radio("Select a language model", ["GPT-3.5", "GPT-3.5 Turbo", "GPT-4", "GPT-4 Turbo"])
     temperature = st.slider("Select temperature", 0.1, 1.5)
     st.write(f"Transaction {sample} is:")
-    # st.write(test_setx.iloc[sample])
-    st.write(rescale_transaction(test_setx.iloc[sample]))
+    rescaled_transaction = rescale_transaction(test_setx.iloc[sample])
+    st.write(rescaled_transaction)
     data_sample = pd.DataFrame(test_setx.iloc[sample]).transpose()
-    all_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age']
+    all_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age', 'trans_num']
+    pred_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age']
     data_sample.columns = all_columns
     st.write(f"Transaction {sample} scaled values is:")
     st.write(data_sample)
-    # plot_tree_wrapper(model, 'xgb_tree.pdf', rankdir='UT')
-    # st.pyplot(plt.gcf())
-    prediction, shap_values = predictXGB(data_sample)
+    pred_sample = data_sample.drop(columns=['trans_num'])
+    pred_sample = pred_sample.astype(float)
+    prediction, shap_values = predictXGB(pred_sample)
     shap.plots.waterfall(shap_values[0])
     shap.plots.beeswarm(shap_values)
     st.pyplot(plt.gcf())
     if prediction[0] == 1:
         st.write("### This transaction is flagged as **FRAUD**")
         st.write("#### Let's try to explain why this transaction is flagged as fraud.")
-        shap_importance = pd.DataFrame(shap_values[0].values, all_columns).abs().sort_values(by=0, ascending=False).T
-        st.write(shap_importance.columns.tolist())
-        explanation = get_response_from_query(loadVectorStore(), data_sample, format_important_features(shap_importance), 5, llm, temperature)
+        shap_importance = pd.DataFrame(shap_values[0].values, pred_columns).abs().sort_values(by=0, ascending=False).T
+        top_5_features = shap_importance.columns.tolist()[:5]
+        explanation = get_response_from_query(loadVectorStore(), data_sample, format_important_features(shap_importance), rescaled_transaction, top_5_features, 5, llm, temperature)
         st.write(explanation.content)
     else:
         st.write("### This transaction is **NOT** flagged as fraud.")
