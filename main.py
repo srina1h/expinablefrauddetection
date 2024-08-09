@@ -127,17 +127,17 @@ def format_important_features(sorted_features):
         formatted_features.append(feature_name)
     return formatted_features
 
-def get_recent_transactions_for_user(transaction, top_5_important_features, number_of_transactions=10):
+def get_recent_transactions_for_user(transaction, important_features, number_of_transactions=10):
     full_transaction = fraud_data[(fraud_data['trans_num'] == transaction['trans_num'].values[0])]
     recent_user_transactions = fraud_data[(fraud_data['cc_num'] == full_transaction['cc_num'].values[0])].tail(number_of_transactions)
-    recent_user_transactions = recent_user_transactions[top_5_important_features]
+    recent_user_transactions = recent_user_transactions[important_features]
     return recent_user_transactions
 
-def get_response_from_query(index, transaction, shap_importance_features, re_scaled_transaction, top_5_important_features, k=5, llm = "GPT-3.5", temperature=0.2):
+def get_response_from_query(index, transaction, shap_importance_features, re_scaled_transaction, number_of_recent_transactions, k=5, llm = "GPT-3.5", temperature=0.2):
     transaction['is_fraud'] = 1
 
-    user_transactions = get_recent_transactions_for_user(transaction, top_5_important_features, 100)
-    st.write(user_transactions)
+    user_transactions = get_recent_transactions_for_user(transaction, shap_importance_features, number_of_transactions = number_of_recent_transactions)
+    shap_importance_features = format_important_features(shap_importance_features)
     # loading language model
     if llm == "GPT-3.5":
         chat = ChatOpenAI(model_name="gpt-3.5", temperature = temperature)
@@ -149,18 +149,21 @@ def get_response_from_query(index, transaction, shap_importance_features, re_sca
         chat = ChatOpenAI(model_name="gpt-4-turbo", temperature= temperature)
     
     prompt_template = """
-        You are a helpful assistant that serves a customer of a large bank. The customer is asking why the following transaction has been flagged
+        You are an assistant that serves a customer of a large bank. The customer is asking why the following transaction has been flagged
         as fraud by the system: 
         
         Category: {category}, Amount: {amt}, City: {city}, State: {state}, Latitude: {lat}, Longitude: {long}, City Population: {city_pop}, Age: {age}
         
-        The bank uses an XGBoost model to detect fraud. Running the prediction through SHAP, the most important features that influenced the model's decision are:
+        The bank uses an XGBoost model to detect fraud (do not disclose this to the customer). 
+        
+        The following features were identified as important by a SHAP analysis that deemed this transaction fraudulent:
         {important_features}
 
-        Here are the last 10 transactions for this user:
+        Here are the important features from the last {number_of_recent_transactions} transactions for this user:
         {recent_transactions}
 
         Use this info to explain why the transaction was flagged as fraud while correlating the important features with the transaction details.
+        Remember to avoid revelaing inner workings of the model, but provide a confident explanation citing examples from the data.
         """
     
     prompt = PromptTemplate(
@@ -169,8 +172,6 @@ def get_response_from_query(index, transaction, shap_importance_features, re_sca
     )
 
     chain = prompt | chat
-
-    re_scaled_transaction['is_fraud'] = 1
 
     new_transaction_data = {
     'category': re_scaled_transaction['category'],
@@ -181,7 +182,8 @@ def get_response_from_query(index, transaction, shap_importance_features, re_sca
     'long': re_scaled_transaction['long'],
     'city_pop': re_scaled_transaction['city_pop'],
     'age': re_scaled_transaction['age'],
-    'important_features': shap_importance_features,
+    'important_features': shap_importance_features,\
+    'number_of_recent_transactions': number_of_recent_transactions,
     'recent_transactions': format_recent_transactions(user_transactions.to_dict(orient='records'))
     }
 
@@ -190,13 +192,10 @@ def get_response_from_query(index, transaction, shap_importance_features, re_sca
 
 def loadTestingdata():
     x_test = pd.read_csv("assets/data/X_test.csv")
-    print(x_test.columns)
-    # x_test = x_test.iloc[:, 1:]
     y_test = pd.read_csv("assets/data/y_test.csv")
     return x_test, y_test
 
 def predictXGB(data):
-    # all_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age']
     prediction = model.predict(data)
     explainer = shap.Explainer(model)
     shap_values = explainer(data)
@@ -218,6 +217,18 @@ def plot_tree_wrapper(xgb_model, filename, rankdir='UT'):
 
     with open(full_filename, 'wb') as f:
         f.write(data)
+
+def select_top_shap_features(shap_importance):
+    shap_importance_sum = shap_importance.sum(axis=1)
+    shap_importance = shap_importance.div(shap_importance_sum, axis=0)
+    top_features = []
+    cumulative_sum = 0
+    for feature in shap_importance.columns:
+        cumulative_sum += shap_importance[feature].values[0]
+        top_features.append(feature)
+        if cumulative_sum >= 0.85:
+            break
+    return top_features
 
 if __name__ == "__main__":
     st.set_page_config(
@@ -249,8 +260,9 @@ if __name__ == "__main__":
         st.write("### This transaction is flagged as **FRAUD**")
         st.write("#### Let's try to explain why this transaction is flagged as fraud.")
         shap_importance = pd.DataFrame(shap_values[0].values, pred_columns).abs().sort_values(by=0, ascending=False).T
-        top_5_features = shap_importance.columns.tolist()[:5]
-        explanation = get_response_from_query(loadVectorStore(), data_sample, format_important_features(shap_importance), rescaled_transaction, top_5_features, 5, llm, temperature)
+        top_features = select_top_shap_features(shap_importance)
+        number_of_recent_transactions = 100
+        explanation = get_response_from_query(loadVectorStore(), data_sample, top_features, rescaled_transaction, number_of_recent_transactions, 5, llm, temperature)
         st.write(explanation.content)
     else:
         st.write("### This transaction is **NOT** flagged as fraud.")
