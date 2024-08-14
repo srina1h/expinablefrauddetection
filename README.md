@@ -9,7 +9,7 @@ Install requirements using requirements.txt
 
 ## Assets
 
-Running requires the download of the assets folder which can be found at - 
+Running requires the download of the assets folder which can be found at - [Assets](https://drive.google.com/file/d/1G7EBI3_qHfydQkKV1QSgCgf2GS_n2K02/view?usp=sharing)
 
 This needs to be placed in the working directory
 
