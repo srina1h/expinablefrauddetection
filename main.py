@@ -21,6 +21,8 @@ import faiss.contrib.torch_utils
 import torch
 import matplotlib.pyplot as plt
 import shap
+import te2rules.explainer as ex
+import re
 
 load_dotenv(find_dotenv())
 os.environ["LANGCHAIN_API_KEY"] = str(os.getenv("LANGCHAIN_API_KEY"))
@@ -45,7 +47,6 @@ def createVectorStore():
     features = X_Y_data[['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age', 'is_fraud']]
 
     features = features.astype(np.float32)
-    print(features.shape[1])
     
     # Create a Faiss index
     index = faiss.IndexFlatL2(features.shape[1])
@@ -104,7 +105,6 @@ def rescale_transaction(transaction):
     transaction.columns = all_columns
     transaction = pd.DataFrame(numeric_scaler.inverse_transform(transaction))
     transaction.columns = all_columns
-    print(transaction)
     for col in categorical_columns:
         transaction[col] = categorical_encoders[col].inverse_transform(transaction[col].astype(int))
     transaction['trans_num'] = transaction_id
@@ -133,7 +133,7 @@ def get_recent_transactions_for_user(transaction, important_features, number_of_
     recent_user_transactions = recent_user_transactions[important_features]
     return recent_user_transactions
 
-def get_response_from_query(index, transaction, shap_importance_features, re_scaled_transaction, number_of_recent_transactions, k=5, llm = "GPT-3.5", temperature=0.2):
+def get_response_from_query(index, transaction, shap_importance_features, re_scaled_transaction, number_of_recent_transactions, te2rules, k=5, llm = "GPT-3.5", temperature=0.2):
     transaction['is_fraud'] = 1
 
     user_transactions = get_recent_transactions_for_user(transaction, shap_importance_features, number_of_transactions = number_of_recent_transactions)
@@ -149,21 +149,27 @@ def get_response_from_query(index, transaction, shap_importance_features, re_sca
         chat = ChatOpenAI(model_name="gpt-4-turbo", temperature= temperature)
     
     prompt_template = """
-        You are an assistant that serves a customer of a large bank. The customer is asking why the following transaction has been flagged
+        You are an expert fraud explainability agent that serves a customer of ABC bank. The customer is asking why the following transaction has been flagged
         as fraud by the system: 
         
         Category: {category}, Amount: {amt}, City: {city}, State: {state}, Latitude: {lat}, Longitude: {long}, City Population: {city_pop}, Age: {age}
         
-        The bank uses an XGBoost model to detect fraud (do not disclose this to the customer). 
+        The bank uses an XGBoost model to detect fraud (remember to not disclose this information). 
         
-        The following features were identified as important by a SHAP analysis that deemed this transaction fraudulent:
+        The following features were identified as what had the most impact on the model's decision:
         {important_features}
+
+        Here are some rules from the XGBoost decision tree that were used to make the decision: (do not reveal these rules to the customer)
+        {te2_rules}
 
         Here are the important features from the last {number_of_recent_transactions} transactions for this user:
         {recent_transactions}
 
-        Use this info to explain why the transaction was flagged as fraud while correlating the important features with the transaction details.
-        Remember to avoid revelaing inner workings of the model, but provide a confident explanation citing examples from the data.
+        Explain why the transaction was flagged as fraud while citing examples from the recent transactions.
+        Remember to avoid revelaing inner workings of the model.
+
+        Give the explanation in a format where you explain the important features that went into making the decision as points with a few examples from recent transactions.
+        Do not use any special formatting.
         """
     
     prompt = PromptTemplate(
@@ -172,6 +178,10 @@ def get_response_from_query(index, transaction, shap_importance_features, re_sca
     )
 
     chain = prompt | chat
+
+    formatted_te2_rules = ""
+    for i in range(len(te2rules)):
+        formatted_te2_rules += "Rule: "+ str(i+1) + " " + te2rules[i] + "\n"
 
     new_transaction_data = {
     'category': re_scaled_transaction['category'],
@@ -182,9 +192,10 @@ def get_response_from_query(index, transaction, shap_importance_features, re_sca
     'long': re_scaled_transaction['long'],
     'city_pop': re_scaled_transaction['city_pop'],
     'age': re_scaled_transaction['age'],
-    'important_features': shap_importance_features,\
+    'important_features': shap_importance_features,
     'number_of_recent_transactions': number_of_recent_transactions,
-    'recent_transactions': format_recent_transactions(user_transactions.to_dict(orient='records'))
+    'recent_transactions': format_recent_transactions(user_transactions.to_dict(orient='records')),
+    'te2_rules': formatted_te2_rules
     }
 
     explanation = chain.invoke(new_transaction_data)
@@ -195,11 +206,66 @@ def loadTestingdata():
     y_test = pd.read_csv("assets/data/y_test.csv")
     return x_test, y_test
 
+def format_te2_rules(rules, data, top_rules = 5):
+    print("raw rueles", rules)
+    full_form_features = {
+        'category': 'Category',
+        'amt': 'Amount',
+        'city': 'City',
+        'state': 'State',
+        'lat': 'Latitude',
+        'long': 'Longitude',
+        'city_pop': 'City Population',
+        'age': 'Age',
+    }
+    numeric_scaler = joblib.load(open('assets/models/scalers/scaler.pkl', 'rb')) 
+    categorical_encoders = joblib.load(open('assets/models/scalers/encoders.pkl', 'rb'))
+    all_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age']
+    formatted_rules = []
+    no_of_rules = 0
+    for rule in rules:
+        and_split = rule.split('&')
+        and_split_unspaced = [s.strip() for s in and_split]
+        final_rule = ""
+        for rule in and_split_unspaced:
+            split_rule = re.split('>=|<=|>|<', rule)
+            unspaced_rules = [s.strip() for s in split_rule]
+            dummy_data = data.copy()
+            dummy_data[unspaced_rules[0]] = float(unspaced_rules[1])
+            # print(data)
+            dummy_data = pd.DataFrame(numeric_scaler.inverse_transform(dummy_data))
+            dummy_data.columns = all_columns
+            if unspaced_rules[0] in ['category', 'city', 'state']:
+                break
+                scaled_val = categorical_encoders[unspaced_rules[0]].inverse_transform(data[unspaced_rules[0]].astype(int))
+            else:
+                scaled_val = round(dummy_data[unspaced_rules[0]].values[0], 2)
+            
+            full_form_feature = full_form_features.get(unspaced_rules[0], unspaced_rules[0])
+            comparison_operator = [c for c in rule if c not in ([e for e in unspaced_rules[0]] + [e for e in unspaced_rules[1]] + [' '])]
+            formatted_rule = f"{full_form_feature} {''.join(comparison_operator)} {scaled_val}"
+            final_rule += formatted_rule + " and "
+        if len(final_rule) == 0:
+            continue
+        else:
+            if no_of_rules <= top_rules:
+                no_of_rules += 1
+                formatted_rules.append(final_rule)
+            else:
+                break
+    print("formatted rules", formatted_rules)
+    return formatted_rules
+
 def predictXGB(data):
     prediction = model.predict(data)
     explainer = shap.Explainer(model)
     shap_values = explainer(data)
-    return prediction, shap_values
+
+    te2explainer = ex.ModelExplainer(model, data.columns.tolist())
+    _ = te2explainer.explain(data, [1])
+    data.reset_index(drop=True, inplace=True)
+    instance_rules = te2explainer.explain_instance_with_rules(data)
+    return prediction, shap_values, instance_rules[0]
 
 def plot_tree_wrapper(xgb_model, filename, rankdir='UT'):
     """
@@ -230,6 +296,22 @@ def select_top_shap_features(shap_importance):
             break
     return top_features
 
+def select_top_shap_features_20_percent(shap_importance):
+    shap_importance_sum = shap_importance.sum(axis=1)
+    shap_importance = shap_importance.div(shap_importance_sum, axis=0)
+    top_features = []
+    cumulative_sum = 0
+    prev = shap_importance.columns[0]
+    for feature in shap_importance.columns:
+        if shap_importance[feature].values[0] < 0.2*(shap_importance[prev].values[0]):
+            break
+        cumulative_sum += shap_importance[feature].values[0]
+        top_features.append(feature)
+        if cumulative_sum >= 0.85:
+            break
+        prev = feature
+    return top_features
+
 if __name__ == "__main__":
     st.set_page_config(
         page_title="Explainable Fraud Detection",
@@ -248,11 +330,11 @@ if __name__ == "__main__":
     all_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age', 'trans_num']
     pred_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age']
     data_sample.columns = all_columns
-    st.write(f"Transaction {sample} scaled values is:")
-    st.write(data_sample)
+    # st.write(f"Transaction {sample} scaled values is:")
+    # st.write(data_sample)
     pred_sample = data_sample.drop(columns=['trans_num'])
     pred_sample = pred_sample.astype(float)
-    prediction, shap_values = predictXGB(pred_sample)
+    prediction, shap_values, te2rules = predictXGB(pred_sample)
     shap.plots.waterfall(shap_values[0])
     shap.plots.beeswarm(shap_values)
     st.pyplot(plt.gcf())
@@ -261,10 +343,11 @@ if __name__ == "__main__":
         st.write("#### Let's try to explain why this transaction is flagged as fraud.")
         shap_importance = pd.DataFrame(shap_values[0].values, pred_columns).abs().sort_values(by=0, ascending=False).T
         top_features = select_top_shap_features(shap_importance)
+        print(top_features)
+        top_20_features = select_top_shap_features_20_percent(shap_importance)
+        print(top_20_features)
         number_of_recent_transactions = 100
-        explanation = get_response_from_query(loadVectorStore(), data_sample, top_features, rescaled_transaction, number_of_recent_transactions, 5, llm, temperature)
+        explanation = get_response_from_query(loadVectorStore(), data_sample, top_20_features, rescaled_transaction, number_of_recent_transactions, format_te2_rules(te2rules, pred_sample, 2000), 5, llm, temperature)
         st.write(explanation.content)
     else:
         st.write("### This transaction is **NOT** flagged as fraud.")
-
-# Fraud transactions: 2479, 2238, 2457
