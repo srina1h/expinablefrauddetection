@@ -1,20 +1,15 @@
 import streamlit as st
 from dotenv import find_dotenv, load_dotenv
 import os
-import nest_asyncio
 import pandas as pd
 from langsmith import Client
 from langchain.chat_models import ChatOpenAI
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.smith import RunEvalConfig, run_on_dataset
-from langchain import PromptTemplate, LLMChain
+from langchain import PromptTemplate
 from xgboost import XGBClassifier
-from xgboost import plot_tree
 from xgboost import to_graphviz
 import faiss
 import numpy as np
 import faiss
-import pickle
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 import joblib
 import faiss.contrib.torch_utils
@@ -330,8 +325,6 @@ if __name__ == "__main__":
     all_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age', 'trans_num']
     pred_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age']
     data_sample.columns = all_columns
-    # st.write(f"Transaction {sample} scaled values is:")
-    # st.write(data_sample)
     pred_sample = data_sample.drop(columns=['trans_num'])
     pred_sample = pred_sample.astype(float)
     prediction, shap_values, te2rules = predictXGB(pred_sample)
