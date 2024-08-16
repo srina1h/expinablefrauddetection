@@ -7,7 +7,13 @@ All of this information along with the user's last 100 transactions are fed to a
 
 Install requirements using requirements.txt
 
+This notebook uses AI explainability libraries [SHAP](https://shap.readthedocs.io/en/latest/example_notebooks/tabular_examples/tree_based_models/Basic%20SHAP%20Interaction%20Value%20Example%20in%20XGBoost.html) & [TE2Rules](https://github.com/linkedin/TE2Rules)
+
 ## Assets
+
+Dataset can be found at - [Dataset](https://www.kaggle.com/datasets/kartik2112/fraud-detection)
+
+The base model training and the preprocessing can be found here - [Colab notebook link](https://colab.research.google.com/drive/1vuu-INf_eJUDAUXqZK2JuDKx5gDxIuDy?usp=sharing)
 
 Running requires the download of the assets folder which can be found at - [Assets](https://drive.google.com/file/d/1G7EBI3_qHfydQkKV1QSgCgf2GS_n2K02/view?usp=sharing)
 
