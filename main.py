@@ -19,18 +19,25 @@ import shap
 import te2rules.explainer as ex
 import re
 
+# Loading envirtoment variables
+
 load_dotenv(find_dotenv())
 os.environ["LANGCHAIN_API_KEY"] = str(os.getenv("LANGCHAIN_API_KEY"))
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["LANGCHAIN_PROJECT"] = "fraud-detection"
 
-client = Client()
 
+# Global Variables
+client = Client()
 model = XGBClassifier()
 model.load_model("assets/models/xgboost_model.model")
-
 fraud_data = pd.read_csv("assets/data/fraud_data.csv")
+
+# Feature Settings
+
+# te2 rules - Turn off if package dosent work
+ENABLE_TE2RULES = False
 
 def createVectorStore():
     x_train = pd.read_csv("assets/data/x_train.csv")
@@ -68,6 +75,10 @@ def format_transactions(transactions):
     return "\n".join(formatted)
 
 def format_recent_transactions(transactions):
+    """
+    format_recent_transactions: This function takes in a list of transactions and formats them into a human readable format. 
+    It makes the feature names into their full forms.
+    """
     formatted = []
     full_form_features = {
         'category': 'Category',
@@ -89,6 +100,9 @@ def format_recent_transactions(transactions):
     return formatted
 
 def rescale_transaction(transaction):
+    """
+    rescale_transaction: This function takes in a transaction and rescales it to the original values.
+    """
     transaction_id = transaction.pop('trans_num')
     categorical_columns = ['category', 'city', 'state']
     all_columns = ['category', 'amt', 'city', 'state', 'lat', 'long', 'city_pop', 'age']
@@ -123,12 +137,19 @@ def format_important_features(sorted_features):
     return formatted_features
 
 def get_recent_transactions_for_user(transaction, important_features, number_of_transactions=10):
+    """
+    get_recent_transactions_for_user: This function takes in a transaction and returns the last n transactions for the user.
+    """
     full_transaction = fraud_data[(fraud_data['trans_num'] == transaction['trans_num'].values[0])]
     recent_user_transactions = fraud_data[(fraud_data['cc_num'] == full_transaction['cc_num'].values[0])].tail(number_of_transactions)
     recent_user_transactions = recent_user_transactions[important_features]
     return recent_user_transactions
 
 def get_response_from_query(index, transaction, shap_importance_features, re_scaled_transaction, number_of_recent_transactions, te2rules, k=5, llm = "GPT-3.5", temperature=0.2):
+    """
+    get_response_from_query: This function takes in a transaction, the important features that influenced the prediction and the rules that the model used to make the prediction.
+    It then formats the transactions and the rules and sends it to the LLM to get an explanation.
+    """
     transaction['is_fraud'] = 1
 
     user_transactions = get_recent_transactions_for_user(transaction, shap_importance_features, number_of_transactions = number_of_recent_transactions)
@@ -143,7 +164,48 @@ def get_response_from_query(index, transaction, shap_importance_features, re_sca
     elif llm == "GPT-4 Turbo":
         chat = ChatOpenAI(model_name="gpt-4-turbo", temperature= temperature)
     
-    prompt_template = """
+    if ENABLE_TE2RULES == False:
+        prompt_template = """
+        You are an expert fraud explainability agent that serves a customer of ABC bank. The customer is asking why the following transaction has been flagged
+        as fraud by the system: 
+        
+        Category: {category}, Amount: {amt}, City: {city}, State: {state}, Latitude: {lat}, Longitude: {long}, City Population: {city_pop}, Age: {age}
+        
+        The bank uses an XGBoost model to detect fraud (remember to not disclose this information). 
+        
+        The following features were identified as what had the most impact on the model's decision:
+        {important_features}
+
+        Here are the important features from the last {number_of_recent_transactions} transactions for this user:
+        {recent_transactions}
+
+        Explain why the transaction was flagged as fraud while citing examples from the recent transactions.
+        Remember to avoid revealing inner workings of the model.
+
+        Give the explanation in a format where you explain the important features that went into making the decision as points with a few examples from recent transactions.
+        Do not use any special formatting.
+        """
+
+        prompt = PromptTemplate(
+            input_variables=["category", "amt", "city", "state", "lat", "long", "city_pop", "age", "important_features", "number_of_recent_transactions", "recent_transactions"],
+            template=prompt_template
+        )
+
+        new_transaction_data = {
+            'category': re_scaled_transaction['category'],
+            'amt': re_scaled_transaction['amt'],
+            'city': re_scaled_transaction['city'],
+            'state': re_scaled_transaction['state'],
+            'lat': re_scaled_transaction['lat'],
+            'long': re_scaled_transaction['long'],
+            'city_pop': re_scaled_transaction['city_pop'],
+            'age': re_scaled_transaction['age'],
+            'important_features': shap_importance_features,
+            'number_of_recent_transactions': number_of_recent_transactions,
+            'recent_transactions': format_recent_transactions(user_transactions.to_dict(orient='records')),
+            }
+    else:
+        prompt_template = """
         You are an expert fraud explainability agent that serves a customer of ABC bank. The customer is asking why the following transaction has been flagged
         as fraud by the system: 
         
@@ -161,38 +223,37 @@ def get_response_from_query(index, transaction, shap_importance_features, re_sca
         {recent_transactions}
 
         Explain why the transaction was flagged as fraud while citing examples from the recent transactions.
-        Remember to avoid revelaing inner workings of the model.
+        Remember to avoid revealing inner workings of the model.
 
         Give the explanation in a format where you explain the important features that went into making the decision as points with a few examples from recent transactions.
         Do not use any special formatting.
         """
+
+        prompt = PromptTemplate(
+            input_variables=["category", "amt", "city", "state", "lat", "long", "city_pop", "age", "important_features", "number_of_recent_transactions", "recent_transactions", "te2_rules"],
+            template=prompt_template
+        )
     
-    prompt = PromptTemplate(
-        input_variables=["category", "amt", "city", "state", "lat", "long", "city_pop", "age", "important_features", "recent_transactions"],
-        template=prompt_template
-    )
+        formatted_te2_rules = ""
+        for i in range(len(te2rules)):
+            formatted_te2_rules += "Rule: "+ str(i+1) + " " + te2rules[i] + "\n"
+
+        new_transaction_data = {
+        'category': re_scaled_transaction['category'],
+        'amt': re_scaled_transaction['amt'],
+        'city': re_scaled_transaction['city'],
+        'state': re_scaled_transaction['state'],
+        'lat': re_scaled_transaction['lat'],
+        'long': re_scaled_transaction['long'],
+        'city_pop': re_scaled_transaction['city_pop'],
+        'age': re_scaled_transaction['age'],
+        'important_features': shap_importance_features,
+        'number_of_recent_transactions': number_of_recent_transactions,
+        'recent_transactions': format_recent_transactions(user_transactions.to_dict(orient='records')),
+        'te2_rules': formatted_te2_rules
+        }
 
     chain = prompt | chat
-
-    formatted_te2_rules = ""
-    for i in range(len(te2rules)):
-        formatted_te2_rules += "Rule: "+ str(i+1) + " " + te2rules[i] + "\n"
-
-    new_transaction_data = {
-    'category': re_scaled_transaction['category'],
-    'amt': re_scaled_transaction['amt'],
-    'city': re_scaled_transaction['city'],
-    'state': re_scaled_transaction['state'],
-    'lat': re_scaled_transaction['lat'],
-    'long': re_scaled_transaction['long'],
-    'city_pop': re_scaled_transaction['city_pop'],
-    'age': re_scaled_transaction['age'],
-    'important_features': shap_importance_features,
-    'number_of_recent_transactions': number_of_recent_transactions,
-    'recent_transactions': format_recent_transactions(user_transactions.to_dict(orient='records')),
-    'te2_rules': formatted_te2_rules
-    }
-
     explanation = chain.invoke(new_transaction_data)
     return explanation
 
@@ -202,7 +263,14 @@ def loadTestingdata():
     return x_test, y_test
 
 def format_te2_rules(rules, data, top_rules = 5):
-    print("raw rueles", rules)
+    """
+    format_te2_rules: Rules from TE2Rules are in the form "Rule a & Rule b & Rule c". 
+    This function formats the rules into a human readable format. First each rule is split by line,
+    then each rule is split by '&'. The features are converted into their full forms and the values
+    are scaled back into original. This is for the LLM to understand better.
+
+    Categorical rules make no sense & are ignored (ex: category > 1.76 adds no value)
+    """
     full_form_features = {
         'category': 'Category',
         'amt': 'Amount',
@@ -227,7 +295,6 @@ def format_te2_rules(rules, data, top_rules = 5):
             unspaced_rules = [s.strip() for s in split_rule]
             dummy_data = data.copy()
             dummy_data[unspaced_rules[0]] = float(unspaced_rules[1])
-            # print(data)
             dummy_data = pd.DataFrame(numeric_scaler.inverse_transform(dummy_data))
             dummy_data.columns = all_columns
             if unspaced_rules[0] in ['category', 'city', 'state']:
@@ -248,13 +315,21 @@ def format_te2_rules(rules, data, top_rules = 5):
                 formatted_rules.append(final_rule)
             else:
                 break
-    print("formatted rules", formatted_rules)
     return formatted_rules
 
 def predictXGB(data):
+    """
+    predictXGB: This function takes in a transaction and predicts if it is fraud or not. 
+    It also returns the SHAP values and the rules from TE2Rules. SHAP analysis returns the most
+    important features that influenced the outcome of a prediction. TE2rules explains the explicit
+    rules that the model used to make the prediction.
+    """
     prediction = model.predict(data)
     explainer = shap.Explainer(model)
     shap_values = explainer(data)
+
+    if ENABLE_TE2RULES == False:
+        return prediction, shap_values, None
 
     te2explainer = ex.ModelExplainer(model, data.columns.tolist())
     _ = te2explainer.explain(data, [1])
@@ -291,18 +366,25 @@ def select_top_shap_features(shap_importance):
             break
     return top_features
 
-def select_top_shap_features_20_percent(shap_importance):
+def select_top_shap_features_percent(shap_importance, percent = 0.2, sum_threshold = 0.85):
+    """
+    select_top_shap_features_percent: This function takes in the shap values. It returns the top features that contributed to the prediction
+    based on the how much contribution is specified in sum_threshold. percent is the percentage of the previous feature that the next feature
+    needs to be in order to be considered towards the sum_threshold.
+
+    This is so that significant features are only chosen and the fluff is sifted out.
+    """
     shap_importance_sum = shap_importance.sum(axis=1)
     shap_importance = shap_importance.div(shap_importance_sum, axis=0)
     top_features = []
     cumulative_sum = 0
     prev = shap_importance.columns[0]
     for feature in shap_importance.columns:
-        if shap_importance[feature].values[0] < 0.2*(shap_importance[prev].values[0]):
+        if shap_importance[feature].values[0] < percent*(shap_importance[prev].values[0]):
             break
         cumulative_sum += shap_importance[feature].values[0]
         top_features.append(feature)
-        if cumulative_sum >= 0.85:
+        if cumulative_sum >= sum_threshold:
             break
         prev = feature
     return top_features
@@ -336,11 +418,12 @@ if __name__ == "__main__":
         st.write("#### Let's try to explain why this transaction is flagged as fraud.")
         shap_importance = pd.DataFrame(shap_values[0].values, pred_columns).abs().sort_values(by=0, ascending=False).T
         top_features = select_top_shap_features(shap_importance)
-        print(top_features)
-        top_20_features = select_top_shap_features_20_percent(shap_importance)
-        print(top_20_features)
+        top_20_features = select_top_shap_features_percent(shap_importance, 0.2, 0.85)
         number_of_recent_transactions = 100
-        explanation = get_response_from_query(loadVectorStore(), data_sample, top_20_features, rescaled_transaction, number_of_recent_transactions, format_te2_rules(te2rules, pred_sample, 2000), 5, llm, temperature)
+        if ENABLE_TE2RULES == False:
+            explanation = get_response_from_query(loadVectorStore(), data_sample, top_20_features, rescaled_transaction, number_of_recent_transactions, None, 5, llm, temperature)
+        else:
+            explanation = get_response_from_query(loadVectorStore(), data_sample, top_20_features, rescaled_transaction, number_of_recent_transactions, format_te2_rules(te2rules, pred_sample, 2000), 5, llm, temperature)
         st.write(explanation.content)
     else:
         st.write("### This transaction is **NOT** flagged as fraud.")
