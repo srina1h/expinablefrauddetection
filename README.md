@@ -9,6 +9,8 @@ Install requirements using requirements.txt
 
 This notebook uses AI explainability libraries [SHAP](https://shap.readthedocs.io/en/latest/example_notebooks/tabular_examples/tree_based_models/Basic%20SHAP%20Interaction%20Value%20Example%20in%20XGBoost.html) & [TE2Rules](https://github.com/linkedin/TE2Rules)
 
+Tested on Python 3.11.3 + (May not work in previous versions)
+
 ## Assets
 
 Dataset can be found at - [Dataset](https://www.kaggle.com/datasets/kartik2112/fraud-detection)
